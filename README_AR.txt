@@ -1,40 +1,32 @@
-BULLY CO-OP - HAMDAN EDITION | Position probe v0.4 (SOURCE ONLY)
-==============================================================
-مهم: هذه تجربة قراءة موقع جيمي فقط، وليست لعباً جماعياً جاهزاً.
+Bully Co-op Hamdan - POSITION DIAGNOSTIC v0.5 (READ-ONLY)
+==========================================================
 
-اللي تأكدنا منه سابقاً عند حمدان:
-- نسخة Bully.exe الأصلية لديه حجمها 8,204,288 بايت (Windows x86).
-- SHA256 للملف الذي فحصناه:
-  bd6e757dba71f04539f0c3a66dd216f40450456f0012becd2e14848dd3ec174e
-- DLL v0.3 حمّله المحرك وعمل التمرير إلى نظام التحكم الأصلي.
+اللوق السابق أثبت أن DLL يعمل، لكنه كرر waiting لأن v0.4 استخدم مسار مدير
+اللاعبين بدل مؤشر شخصية جيمي الذي تستخدمه الدالة الأصلية PlayerGetPosXYZ.
+هذا الإصدار يقرأ المؤشر المباشر [Bully.exe+0x81AEA8] بعد فحص نسخة اللعبة
+وتوقيع الدالة، ويتبع مؤشرات التحويل نفسها الموجودة في Bully.exe.
 
-التقدم في v0.4:
-- تحليل الدالة الداخلية PlayerGetPosXYZ في Bully.exe نفسه.
-- تحديد مسار قراءة X وY وZ من مدير اللاعبين، ووضعه في DLL للقراءة فقط.
-- فحص حجم Bully.exe وتوقيع الدالة قبل أي قراءة للذاكرة.
-- قراءة محمية بـ ReadProcessMemory؛ لا كتابة للذاكرة ولا تعديل على الشخصيات.
-- تسجل الإحداثيات في BullyCoop_bridge.log عند حركة جيمي، مرة كل 250 مللي ثانية
-  كحد أقصى، وتقلل الكتابة إذا بقي جيمي واقفاً.
+تجربة الإصدار v0.5:
+1. ارفع محتويات هذا ZIP إلى جذر مستودع Bully الخاص بك (لا ترفع ZIP نفسه).
+   إن كان المشروع مرفوعًا سابقًا، استبدل bridge/dinput8_proxy.cpp
+   و .github/workflows/build-bully-position.yml في جذر المستودع.
+2. افتح Actions > Build Bully Co-op Position Probe v0.5 (x86) > Run workflow.
+3. بعد نجاح البناء افتح Artifacts وحمّل BullyCoop-Hamdan-PositionProbe-v05-x86.
+4. أغلق اللعبة، وخذ نسخة احتياطية من dinput8.dll الموجود بجانب Bully.exe.
+5. ركّب dinput8.dll المبني (فقط للعبة ذات ملف exe الذي فحصناه).
+6. ادخل إلى عالم اللعبة، امشِ مدة 20-30 ثانية، ثم أغلق اللعبة.
+7. افتح BullyCoop_bridge.log وفتش عن:
+   BullyCoop position v0.5: corrected global-player actor lookup; read-only
+   BullyCoop position: x=... y=... z=...
+   أو BullyCoop position: waiting: <reason>
+   أرسل آخر 15 سطراً لو استمرت المشكلة.
 
-طريقة بناء DLL في GitHub:
-1) ارفع محتويات هذا ZIP إلى جذر مستودع Bully الخاص بك (وليس ZIP نفسه).
-2) تأكد من وجود .github/workflows/build-bully-position.yml في جذر المستودع.
-3) افتح Actions ثم Build Bully Co-op Position Probe (x86) ثم Run workflow.
-4) بعد نجاح البناء حمل Artifact: BullyCoop-Hamdan-Position-Probe-x86.
-5) فك ضغطه وستجد dinput8.dll، هذا فقط اللي يحتاج تجربة.
+هذا اختبار قراءة إحداثيات فقط؛ لا يوجد لاعب ثانٍ داخل Bully حتى الآن.
+لا تغيّر أو تحفظ Bully.exe؛ ولا تستخدم الملف مع لعبة بإصدار مختلف.
+لا يمكن ضمان نجاح DLL قبل بنائه وتشغيله على ويندوز.
 
-طريقة تجربة النسخة الجديدة:
-1) أقفل اللعبة، وخذ نسخة احتياطية من dinput8.dll السابق.
-2) استبدله بملف dinput8.dll الذي بنيته في GitHub.
-3) شغل Bully.exe وادخل عالم اللعب وحرك جيمي لمدة دقيقة.
-4) اقفل اللعبة، وافتح BullyCoop_bridge.log بالمفكرة.
-5) إذا ظهرت سطور مثل: BullyCoop position: x=... y=... z=... فقد نجحت قراءة الموقع.
-   إذا ظهرت waiting... فقط، أرسل الملف لنراجع قراءة المؤشرات.
-6) إذا لم تعمل اللعبة، احذف الملف الجديد وأعد dinput8.dll القديم.
-
-القيود:
-- لم يُبْنَ هذا الإصدار v0.4 إلى DLL ولم يُختبر داخل Bully حتى الآن.
-- كود الربط يتأكد من إصدار exe الذي قدمه حمدان، ولا يستخدم العناوين على إصدار مختلف.
-- قراءة اللعبة تتم من داخل نفس العملية، وقد تنجح أو تحتاج تعديل عند اختبارها فعلياً.
-- لا يرسل الموقع للشبكة ولا يُظهر اللاعب الثاني في عالم Bully بعد.
-- لا ترفع Bully.exe إلى مستودع GitHub (غير مطلوب للبناء).
+Proof in submitted Bully.exe disassembly:
+  005d267f call 005c7380 with category 3; 005c7395 mov eax,ds:00c1aea8.
+  005d2693 read [esi+1554], position via nested+14+30 or actor+14+30.
+  005d2687 calls 005db940 manager at 00d02850, but ignores its return.
+  v0.4 read the wrong player-manager field for selecting the actor.

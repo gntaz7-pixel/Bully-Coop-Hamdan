@@ -1,4 +1,4 @@
-// Bully Co-op Hamdan | Position Probe v0.4 | Bully: Scholarship Edition (user-provided build only).
+// Bully Co-op Hamdan | Position Probe v0.5 | Bully: Scholarship Edition (user-provided build only).
 // READ-ONLY: does not patch the game, modify position, create NPCs, or enable multiplayer.
 // This DLL is a DirectInput 8 proxy: it forwards actual input calls to the system DLL.
 #define WIN32_LEAN_AND_MEAN
@@ -15,7 +15,10 @@ static HMODULE g_system_dinput8 = nullptr;
 static const DWORD kExpectedBullySize = 8204288; // User's Bully.exe, SHA256 below in README.
 static const uintptr_t kImageBase = 0x400000;
 static const uintptr_t kPlayerGetPosRva = 0x1D2670;
-static const uintptr_t kPlayerManagerRva = 0x902850; // 0xD02850 - original image base.
+// 0x5C7380 (called by native PlayerGetPosXYZ at 0x5D267F)
+// returns the script-managed player actor directly from [0x00C1AEA8]
+// for entity category 3. v0.4 incorrectly read the *separate* player manager.
+static const uintptr_t kPlayerActorGlobalRva = 0x81AEA8; // VA 0x00C1AEA8 - image base.
 static const char kPlayerGetPosSignature[] = "\x83\xec\x0c\x56\x51\x8b\xc4\x6a\x00\xc7\x00\x03\x00\x00\x00";
 
 static void WriteProbeLog(const char* msg) {
@@ -94,47 +97,76 @@ static bool VersionMatches(uintptr_t base) {
     return true;
 }
 
-// Pointer path reproduced from Bully.exe's registered native PlayerGetPosXYZ.
-// This is a conservative snapshot of that read-only path, not a call into the script VM.
-static bool ReadJimmyPosition(uintptr_t base, Position* out) {
-    const uintptr_t manager = base + kPlayerManagerRva;
-    uint32_t count = 0, active = 0, player = 0;
-    if (!ReadAt(manager + 0x6B84, &count) || !ReadAt(manager + 0x6B88, &active)) return false;
-    // The game's original routine assumes the index is valid. Guard the probe more strictly.
-    if (count == 0 || count > 32 || active >= count) return false;
-    if (!ReadAt(manager + 0x6B64 + active * 4u, &player) || player < 0x10000) return false;
+// This is the character-pointer path used by the game native PlayerGetPosXYZ:
+//   PlayerGetPosXYZ -> 0x5C7380(type=3) -> mov eax,[0xC1AEA8]
+//   actor->0x1554 / actor->0x14 -> transform->0x30 (or actor+0x04).
+// v0.4 read 0xD02850+0x6B84 as if it were the actor lookup; this is a
+// DIFFERENT manager used later by PlayerGetPosXYZ and is often uninitialized.
+// Read-only, with explicit failure reasons for on-device validation.
+enum class PositionStatus {
+    Good, GlobalEmpty, GlobalUnreadable, ActorInvalid, NestedUnreadable,
+    TransformUnreadable, CoordinatesUnreadable, CoordinatesImplausible
+};
 
-    uint32_t nested = 0, transform = 0;
-    uintptr_t positionAddress = 0;
-    if (!ReadAt(static_cast<uintptr_t>(player) + 0x1554, &nested)) return false;
-    if (nested) {
-        if (!ReadAt(static_cast<uintptr_t>(nested) + 0x14, &transform)) return false;
-        positionAddress = transform ? static_cast<uintptr_t>(transform) + 0x30 :
-                                      static_cast<uintptr_t>(nested) + 0x04;
-    } else {
-        if (!ReadAt(static_cast<uintptr_t>(player) + 0x14, &transform)) return false;
-        positionAddress = transform ? static_cast<uintptr_t>(transform) + 0x30 :
-                                      static_cast<uintptr_t>(player) + 0x04;
+static const char* StatusName(PositionStatus status) {
+    switch (status) {
+        case PositionStatus::Good: return "ready";
+        case PositionStatus::GlobalEmpty: return "player actor global is empty (menu/loading?)";
+        case PositionStatus::GlobalUnreadable: return "unable to read actor global";
+        case PositionStatus::ActorInvalid: return "actor pointer looks invalid";
+        case PositionStatus::NestedUnreadable: return "unable to read actor nested pointer";
+        case PositionStatus::TransformUnreadable: return "unable to read transform pointer";
+        case PositionStatus::CoordinatesUnreadable: return "unable to read coordinates";
+        case PositionStatus::CoordinatesImplausible: return "coordinates are not finite/in expected range";
     }
-    if (!ReadAt(positionAddress, out)) return false;
-    return std::isfinite(out->x) && std::isfinite(out->y) && std::isfinite(out->z) &&
-           std::fabs(out->x) < 1000000.0f && std::fabs(out->y) < 1000000.0f &&
-           std::fabs(out->z) < 1000000.0f;
+    return "unknown";
+}
+
+static PositionStatus ReadJimmyPosition(uintptr_t base, Position* out) {
+    if (!out) return PositionStatus::CoordinatesUnreadable;
+    uint32_t actor = 0;
+    if (!ReadAt(base + kPlayerActorGlobalRva, &actor)) return PositionStatus::GlobalUnreadable;
+    if (!actor) return PositionStatus::GlobalEmpty;
+    if (actor < 0x10000u || actor > 0x7FFFFFFFu) return PositionStatus::ActorInvalid;
+
+    uint32_t nested = 0;
+    if (!ReadAt(static_cast<uintptr_t>(actor) + 0x1554u, &nested)) return PositionStatus::NestedUnreadable;
+    uint32_t transform = 0;
+    uintptr_t address = 0;
+    if (nested != 0) {
+        if (!ReadAt(static_cast<uintptr_t>(nested) + 0x14u, &transform))
+            return PositionStatus::TransformUnreadable;
+        address = transform ? static_cast<uintptr_t>(transform) + 0x30u :
+                              static_cast<uintptr_t>(nested) + 0x04u;
+    } else {
+        if (!ReadAt(static_cast<uintptr_t>(actor) + 0x14u, &transform))
+            return PositionStatus::TransformUnreadable;
+        address = transform ? static_cast<uintptr_t>(transform) + 0x30u :
+                              static_cast<uintptr_t>(actor) + 0x04u;
+    }
+    if (!ReadAt(address, out)) return PositionStatus::CoordinatesUnreadable;
+    if (!std::isfinite(out->x) || !std::isfinite(out->y) || !std::isfinite(out->z) ||
+        std::fabs(out->x) >= 1000000.0f || std::fabs(out->y) >= 1000000.0f ||
+        std::fabs(out->z) >= 1000000.0f)
+        return PositionStatus::CoordinatesImplausible;
+    return PositionStatus::Good;
 }
 
 static DWORD WINAPI PositionThread(LPVOID parameter) {
     const uintptr_t base = reinterpret_cast<uintptr_t>(parameter);
     if (!VersionMatches(base)) return 0;
-    WriteProbeLog("BullyCoop position: read-only probe enabled; no gameplay changes\r\n");
+    WriteProbeLog("BullyCoop position v0.5: corrected global-player actor lookup; read-only\r\n");
     bool previouslyAvailable = false;
     Position previous = {};
     DWORD lastLog = 0;
     DWORD lastWait = 0;
+    PositionStatus previousStatus = PositionStatus::Good;
     while (true) {
         Sleep(250); // 4 reads / s; write the log only when moving or every 10 seconds.
         Position now = {};
         const DWORD tick = GetTickCount();
-        if (ReadJimmyPosition(base, &now)) {
+        const PositionStatus status = ReadJimmyPosition(base, &now);
+        if (status == PositionStatus::Good) {
             const bool moved = !previouslyAvailable ||
                 (std::fabs(now.x - previous.x) + std::fabs(now.y - previous.y) +
                  std::fabs(now.z - previous.z)) > 0.2f;
@@ -148,12 +180,15 @@ static DWORD WINAPI PositionThread(LPVOID parameter) {
             }
             previouslyAvailable = true;
         } else {
-            if ((previouslyAvailable || tick - lastWait >= 15000)) {
-                WriteProbeLog("BullyCoop position: waiting for a valid player (loading/menu?)\r\n");
+            if (previouslyAvailable || status != previousStatus || tick - lastWait >= 15000) {
+                char line[180] = {};
+                sprintf_s(line, sizeof(line), "BullyCoop position: waiting: %s\r\n", StatusName(status));
+                WriteProbeLog(line);
                 lastWait = tick;
             }
             previouslyAvailable = false;
         }
+        previousStatus = status;
     }
     // Unreachable during normal game lifetime.
     return 0;
