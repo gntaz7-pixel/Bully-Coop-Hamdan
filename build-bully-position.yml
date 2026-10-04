@@ -1,0 +1,44 @@
+name: Build Bully Co-op Position Probe (x86)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'bridge/**'
+      - 'BUILD_WINDOWS.cmd'
+      - '.github/workflows/build-bully-position.yml'
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Download sources
+        uses: actions/checkout@v4
+      - name: Build 32-bit DLL
+        shell: cmd
+        run: BUILD_WINDOWS.cmd
+      - name: Check DLL architecture and export
+        shell: pwsh
+        run: |
+          $path = 'out/dinput8.dll'
+          if (-not (Test-Path $path)) { throw 'dinput8.dll missing' }
+          $stream = [IO.File]::OpenRead($path)
+          try {
+            $r = [IO.BinaryReader]::new($stream)
+            if ($r.ReadUInt16() -ne 0x5A4D) { throw 'Invalid MZ' }
+            $stream.Position = 0x3c
+            $offset = $r.ReadInt32()
+            $stream.Position = $offset
+            if ($r.ReadUInt32() -ne 0x4550) { throw 'Invalid PE header' }
+            if ($r.ReadUInt16() -ne 0x014c) { throw 'Not x86' }
+          } finally { $stream.Dispose() }
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)
+          if ($dumpbin) {
+            $exports = & dumpbin /exports $path | Out-String
+            if ($exports -notmatch 'DirectInput8Create') { throw 'DirectInput8Create export missing' }
+          }
+          Write-Host 'PASS: PE32 x86 built'
+      - name: Get downloadable probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: BullyCoop-Hamdan-Position-Probe-x86
+          path: out/dinput8.dll
+          if-no-files-found: error
