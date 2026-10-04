@@ -1,32 +1,33 @@
-Bully Co-op Hamdan - POSITION DIAGNOSTIC v0.5 (READ-ONLY)
-==========================================================
+Bully Co-op Hamdan v0.6 - REAL IN-GAME POSITION NETWORK TEST (NO SECOND CHARACTER YET)
+===============================================================================
+تم إثبات قراءة موقع جيمي بنجاح في v0.5 من اللوق الذي أرسله حمدان.
+هذه النسخة تضيف إرسال واستقبال إحداثيات اللاعبين عبر UDP بين جهازين داخل اللعبة نفسها.
+هذه تجربة قراءة/شبكة فقط؛ لا تنشئ شخصية ثانية، ولا تزامن المهمات أو القتال.
 
-اللوق السابق أثبت أن DLL يعمل، لكنه كرر waiting لأن v0.4 استخدم مسار مدير
-اللاعبين بدل مؤشر شخصية جيمي الذي تستخدمه الدالة الأصلية PlayerGetPosXYZ.
-هذا الإصدار يقرأ المؤشر المباشر [Bully.exe+0x81AEA8] بعد فحص نسخة اللعبة
-وتوقيع الدالة، ويتبع مؤشرات التحويل نفسها الموجودة في Bully.exe.
+طريقة التجربة:
+1. ارفع محتويات هذا الأرشيف إلى جذر مستودع GitHub الخاص بـ Bully.
+2. افتح Actions > Build Bully Co-op Network Position Probe v0.6 (x86) ثم Run workflow.
+3. حمّل dinput8.dll المبني؛ لا تستخدم المكتبة قبل نجاح البناء.
+4. اغلق Bully عند الجهازين، واحفظ نسخة احتياطية من أي dinput8.dll أصلي.
+5. ضع dinput8.dll الجديد بجانب Bully.exe عندك وعند خويك.
+6. عند الهوست: انسخ BullyCoop_HOST.ini باسم BullyCoop.ini إلى جانب Bully.exe.
+7. عند الكلاينت: انسخ BullyCoop_GUEST.ini باسم BullyCoop.ini، ثم عدل HostAddress إلى
+   عنوان IPv4 الخاص بالهوست داخل شبكة محلية أو Radmin VPN/ZeroTier.
+8. تأكد أن Port=7791 و SessionCode متطابقان عند الاثنين؛ يفضل تغيير SessionCode
+   إلى رقم مشترك خاص بكم (ستة أرقام على الأقل). الرمز ليس تشفيرا ولا حماية قوية.
+9. اسمح لبرنامج Bully باتصالات UDP على المنفذ 7791 في جدار حماية ويندوز عند الهوست.
+10. شغلوا Bully وادخلوا العالم بشخصية جيمي وامشوا بجهازين.
+11. افتح BullyCoop_bridge.log عند كل جهاز وابحث عن:
+     BullyCoop net v0.6: HOST UDP ready (read-only position exchange)
+     BullyCoop net v0.6: GUEST UDP ready (read-only position exchange)
+     BullyCoop net: first remote player position RECEIVED
+     BullyCoop remote player: x=... y=... z=... age_ms=...
+   هذه هي إحداثيات لاعب الطرف الثاني في جهازك؛ يجب أن تتغير عندما يمشي الطرف الثاني.
 
-تجربة الإصدار v0.5:
-1. ارفع محتويات هذا ZIP إلى جذر مستودع Bully الخاص بك (لا ترفع ZIP نفسه).
-   إن كان المشروع مرفوعًا سابقًا، استبدل bridge/dinput8_proxy.cpp
-   و .github/workflows/build-bully-position.yml في جذر المستودع.
-2. افتح Actions > Build Bully Co-op Position Probe v0.5 (x86) > Run workflow.
-3. بعد نجاح البناء افتح Artifacts وحمّل BullyCoop-Hamdan-PositionProbe-v05-x86.
-4. أغلق اللعبة، وخذ نسخة احتياطية من dinput8.dll الموجود بجانب Bully.exe.
-5. ركّب dinput8.dll المبني (فقط للعبة ذات ملف exe الذي فحصناه).
-6. ادخل إلى عالم اللعبة، امشِ مدة 20-30 ثانية، ثم أغلق اللعبة.
-7. افتح BullyCoop_bridge.log وفتش عن:
-   BullyCoop position v0.5: corrected global-player actor lookup; read-only
-   BullyCoop position: x=... y=... z=...
-   أو BullyCoop position: waiting: <reason>
-   أرسل آخر 15 سطراً لو استمرت المشكلة.
-
-هذا اختبار قراءة إحداثيات فقط؛ لا يوجد لاعب ثانٍ داخل Bully حتى الآن.
-لا تغيّر أو تحفظ Bully.exe؛ ولا تستخدم الملف مع لعبة بإصدار مختلف.
-لا يمكن ضمان نجاح DLL قبل بنائه وتشغيله على ويندوز.
-
-Proof in submitted Bully.exe disassembly:
-  005d267f call 005c7380 with category 3; 005c7395 mov eax,ds:00c1aea8.
-  005d2693 read [esi+1554], position via nested+14+30 or actor+14+30.
-  005d2687 calls 005db940 manager at 00d02850, but ignores its return.
-  v0.4 read the wrong player-manager field for selecting the actor.
+ملاحظات مهمة:
+- هذا الملف لا يدعم اللعب الجماعي داخل العالم بعد؛ يتبادل فقط إحداثيات X/Y/Z.
+- لا تستخدمه على شبكة عامة/إنترنت مفتوح: بروتوكول الاختبار غير مشفر، مصمم لشبكة موثوقة.
+- كل نسخة Bully يجب أن تطابق ملف Bully.exe الخاص بحمدان في نسخة v0.5، وإلا يتوقف الفحص.
+- إذا لم يوجد BullyCoop.ini أو Enabled=0 فالشبكة معطلة؛ تبقى قراءة الموقع فقط.
+- هذا الكود لم يبن ولم يختبر داخل اللعبة بعد؛ نجاح تجربة v0.5 لا يضمن نجاح v0.6.
+- لا تستخدم dinput8.dll الخاص بـ VCCoop مع Bully؛ هذا مشروع منفصل.

@@ -1,13 +1,17 @@
-// Bully Co-op Hamdan | Position Probe v0.5 | Bully: Scholarship Edition (user-provided build only).
-// READ-ONLY: does not patch the game, modify position, create NPCs, or enable multiplayer.
+// Bully Co-op Hamdan | Network Position Probe v0.6 | Bully: Scholarship Edition (user-provided build only).
+// READ-ONLY NETWORK TEST: no game memory writes, no NPC spawning, no co-op gameplay.
 // This DLL is a DirectInput 8 proxy: it forwards actual input calls to the system DLL.
 #define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0601
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <unknwn.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#pragma comment(lib, "Ws2_32.lib")
 
 static INIT_ONCE g_input_init = INIT_ONCE_STATIC_INIT;
 static INIT_ONCE g_probe_init = INIT_ONCE_STATIC_INIT;
@@ -152,17 +156,256 @@ static PositionStatus ReadJimmyPosition(uintptr_t base, Position* out) {
     return PositionStatus::Good;
 }
 
+
+// LAN-only position transport, v0.6.
+// Shares positions between two game processes; does NOT instantiate a remote character.
+// All network access is disabled by default and requires explicit BullyCoop.ini settings.
+// Protocol is intentionally unencrypted; use on trusted private LAN/VPN only.
+static const uint32_t kNetworkMagic = 0x42434f50u; // "BCOP"
+static const uint16_t kNetworkVersion = 1;
+static const DWORD kRemoteTimeoutMs = 3000;
+static const DWORD kPeerResetMs = 10000;
+
+#pragma pack(push, 1)
+struct PositionPacket {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t senderRole; // 1 = host, 2 = guest
+    uint32_t sessionCode;
+    uint32_t sequence;
+    float x;
+    float y;
+    float z;
+};
+#pragma pack(pop)
+static_assert(sizeof(PositionPacket) == 28, "Position packet format changed");
+
+struct NetworkProbe {
+    SOCKET socket = INVALID_SOCKET;
+    bool winsockStarted = false;
+    bool enabled = false;
+    bool host = false;
+    bool peerKnown = false;
+    sockaddr_in peer = {};
+    uint32_t sessionCode = 0;
+    uint32_t nextSequence = 0;
+    uint32_t lastSequence = 0;
+    bool haveSequence = false;
+    bool haveRemote = false;
+    Position remote = {};
+    DWORD lastReceived = 0;
+    DWORD lastRemoteLog = 0;
+    DWORD initializedAt = 0;
+    DWORD lastNoPeerLog = 0;
+    bool previouslyConnected = false;
+};
+
+static void ReadGameDirectoryFile(const char* filename, char out[MAX_PATH]) {
+    out[0] = '\0';
+    const DWORD used = GetModuleFileNameA(nullptr, out, MAX_PATH);
+    if (!used || used >= MAX_PATH) { out[0] = '\0'; return; }
+    char* cursor = out;
+    for (char* it = out; *it; ++it)
+        if (*it == '\\' || *it == '/') cursor = it + 1;
+    *cursor = '\0';
+    if (static_cast<size_t>(cursor - out) + strlen(filename) + 1 > MAX_PATH) {
+        out[0] = '\0';
+        return;
+    }
+    lstrcatA(out, filename);
+}
+
+static bool InitNetwork(NetworkProbe* net) {
+    if (!net) return false;
+    char ini[MAX_PATH] = {};
+    ReadGameDirectoryFile("BullyCoop.ini", ini);
+    if (!ini[0] || GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) {
+        WriteProbeLog("BullyCoop net: inactive (BullyCoop.ini absent)\r\n");
+        return false;
+    }
+    if (GetPrivateProfileIntA("Network", "Enabled", 0, ini) != 1) {
+        WriteProbeLog("BullyCoop net: inactive (Enabled is not 1)\r\n");
+        return false;
+    }
+    char role[16] = {};
+    GetPrivateProfileStringA("Network", "Role", "", role, sizeof(role), ini);
+    if (lstrcmpiA(role, "host") == 0) net->host = true;
+    else if (lstrcmpiA(role, "guest") == 0) net->host = false;
+    else {
+        WriteProbeLog("BullyCoop net: Role must be host or guest; disabled\r\n");
+        return false;
+    }
+    const UINT port = GetPrivateProfileIntA("Network", "Port", 7791, ini);
+    const UINT pin = GetPrivateProfileIntA("Network", "SessionCode", 0, ini);
+    if (port < 1024 || port > 65535 || pin < 100000 || pin > 999999999u) {
+        WriteProbeLog("BullyCoop net: invalid port or session code; disabled\r\n");
+        return false;
+    }
+    net->sessionCode = pin;
+    WSADATA wsadata = {};
+    if (WSAStartup(MAKEWORD(2,2), &wsadata) != 0) {
+        WriteProbeLog("BullyCoop net: WSAStartup failed\r\n");
+        return false;
+    }
+    net->winsockStarted = true;
+    net->socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (net->socket == INVALID_SOCKET) {
+        WriteProbeLog("BullyCoop net: socket creation failed\r\n");
+        WSACleanup(); net->winsockStarted = false;
+        return false;
+    }
+    u_long nonBlocking = 1;
+    if (ioctlsocket(net->socket, FIONBIO, &nonBlocking) != 0) {
+        WriteProbeLog("BullyCoop net: nonblocking socket failed\r\n");
+        closesocket(net->socket); net->socket = INVALID_SOCKET;
+        WSACleanup(); net->winsockStarted = false;
+        return false;
+    }
+    sockaddr_in bindAddress = {};
+    bindAddress.sin_family = AF_INET;
+    bindAddress.sin_port = htons(static_cast<u_short>(net->host ? port : 0));
+    bindAddress.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(net->socket, reinterpret_cast<const sockaddr*>(&bindAddress), sizeof(bindAddress)) != 0) {
+        WriteProbeLog("BullyCoop net: UDP bind failed (is the port already in use?)\r\n");
+        closesocket(net->socket); net->socket = INVALID_SOCKET;
+        WSACleanup(); net->winsockStarted = false;
+        return false;
+    }
+    if (!net->host) {
+        char address[64] = {};
+        GetPrivateProfileStringA("Network", "HostAddress", "", address, sizeof(address), ini);
+        net->peer.sin_family = AF_INET;
+        net->peer.sin_port = htons(static_cast<u_short>(port));
+        if (InetPtonA(AF_INET, address, &net->peer.sin_addr) != 1 ||
+            net->peer.sin_addr.s_addr == INADDR_ANY) {
+            WriteProbeLog("BullyCoop net: invalid HostAddress IPv4; disabled\r\n");
+            closesocket(net->socket); net->socket = INVALID_SOCKET;
+            WSACleanup(); net->winsockStarted = false;
+            return false;
+        }
+        net->peerKnown = true;
+    }
+    net->enabled = true;
+    net->initializedAt = GetTickCount();
+    WriteProbeLog(net->host ?
+        "BullyCoop net v0.6: HOST UDP ready (read-only position exchange)\r\n" :
+        "BullyCoop net v0.6: GUEST UDP ready (read-only position exchange)\r\n");
+    return true;
+}
+
+static bool ValidNetworkPosition(const Position& pos) {
+    return std::isfinite(pos.x) && std::isfinite(pos.y) && std::isfinite(pos.z) &&
+           std::fabs(pos.x) < 1000000.0f && std::fabs(pos.y) < 1000000.0f &&
+           std::fabs(pos.z) < 1000000.0f;
+}
+
+static void SendNetworkPosition(NetworkProbe* net, const Position& local) {
+    if (!net->enabled || !net->peerKnown || !ValidNetworkPosition(local)) return;
+    PositionPacket packet = {};
+    packet.magic = htonl(kNetworkMagic);
+    packet.version = htons(kNetworkVersion);
+    packet.senderRole = htons(net->host ? 1 : 2);
+    packet.sessionCode = htonl(net->sessionCode);
+    packet.sequence = htonl(++net->nextSequence);
+    packet.x = local.x;
+    packet.y = local.y;
+    packet.z = local.z;
+    const int result = sendto(net->socket, reinterpret_cast<const char*>(&packet), sizeof(packet), 0,
+            reinterpret_cast<const sockaddr*>(&net->peer), sizeof(net->peer));
+    if (result == SOCKET_ERROR) {
+        // UDP network errors are not fatal; subsequent updates may succeed.
+        const int error = WSAGetLastError();
+        if (error != WSAEWOULDBLOCK && error != WSAENETUNREACH && error != WSAEHOSTUNREACH) {
+            // Avoid writing every 100 ms when a firewall or network blocks packets.
+            static DWORD lastErrorLog = 0;
+            const DWORD tick = GetTickCount();
+            if (tick - lastErrorLog >= 15000) {
+                WriteProbeLog("BullyCoop net: position send failed (retrying)\r\n");
+                lastErrorLog = tick;
+            }
+        }
+    }
+}
+
+static void ReceiveNetworkPositions(NetworkProbe* net, DWORD tick) {
+    if (!net->enabled) return;
+    if (net->host && net->peerKnown && tick - net->lastReceived > kPeerResetMs) {
+        net->peerKnown = false;
+        net->haveSequence = false;
+        net->haveRemote = false;
+    }
+    // Nonblocking receive, bounded to protect the game's process against UDP packet floods.
+    for (int i = 0; i < 16; ++i) {
+        PositionPacket packet = {};
+        sockaddr_in sender = {};
+        int senderLength = sizeof(sender);
+        const int count = recvfrom(net->socket, reinterpret_cast<char*>(&packet), sizeof(packet), 0,
+                                   reinterpret_cast<sockaddr*>(&sender), &senderLength);
+        if (count == SOCKET_ERROR) {
+            if (WSAGetLastError() != WSAEWOULDBLOCK)
+                WriteProbeLog("BullyCoop net: UDP receive error\r\n");
+            break;
+        }
+        if (count != sizeof(packet) || sender.sin_family != AF_INET ||
+            ntohl(packet.magic) != kNetworkMagic || ntohs(packet.version) != kNetworkVersion ||
+            ntohl(packet.sessionCode) != net->sessionCode ||
+            ntohs(packet.senderRole) != (net->host ? 2 : 1)) continue;
+        Position pos = {packet.x, packet.y, packet.z};
+        if (!ValidNetworkPosition(pos)) continue;
+        if (net->peerKnown) {
+            if (sender.sin_addr.s_addr != net->peer.sin_addr.s_addr ||
+                sender.sin_port != net->peer.sin_port) continue;
+        } else if (net->host) {
+            net->peer = sender;
+            net->peerKnown = true;
+            net->haveSequence = false;
+        } else continue;
+        const uint32_t seq = ntohl(packet.sequence);
+        if (net->haveSequence && static_cast<int32_t>(seq - net->lastSequence) <= 0) continue;
+        net->haveSequence = true;
+        net->lastSequence = seq;
+        net->remote = pos;
+        net->haveRemote = true;
+        net->lastReceived = tick;
+        if (!net->previouslyConnected) {
+            WriteProbeLog("BullyCoop net: first remote player position RECEIVED\r\n");
+            net->previouslyConnected = true;
+        }
+    }
+    if (net->haveRemote && tick - net->lastReceived > kRemoteTimeoutMs) {
+        net->haveRemote = false;
+        net->previouslyConnected = false;
+        WriteProbeLog("BullyCoop net: remote position timed out\r\n");
+    }
+    if (!net->haveRemote && tick - net->initializedAt >= 7000 &&
+        tick - net->lastNoPeerLog >= 15000) {
+        WriteProbeLog("BullyCoop net: waiting for remote player; check both game sessions, firewall, IP, port and SessionCode\r\n");
+        net->lastNoPeerLog = tick;
+    }
+    if (net->haveRemote && tick - net->lastRemoteLog >= 2000) {
+        char text[180] = {};
+        sprintf_s(text, sizeof(text),
+                  "BullyCoop remote player: x=%.2f y=%.2f z=%.2f age_ms=%lu\r\n",
+                  net->remote.x, net->remote.y, net->remote.z,
+                  static_cast<unsigned long>(tick - net->lastReceived));
+        WriteProbeLog(text);
+        net->lastRemoteLog = tick;
+    }
+}
+
 static DWORD WINAPI PositionThread(LPVOID parameter) {
     const uintptr_t base = reinterpret_cast<uintptr_t>(parameter);
     if (!VersionMatches(base)) return 0;
-    WriteProbeLog("BullyCoop position v0.5: corrected global-player actor lookup; read-only\r\n");
+    WriteProbeLog("BullyCoop position v0.6: live actor lookup; read-only UDP probe\r\n");
+    NetworkProbe network = {};
+    const bool networkEnabled = InitNetwork(&network);
     bool previouslyAvailable = false;
     Position previous = {};
     DWORD lastLog = 0;
     DWORD lastWait = 0;
     PositionStatus previousStatus = PositionStatus::Good;
     while (true) {
-        Sleep(250); // 4 reads / s; write the log only when moving or every 10 seconds.
+        Sleep(100); // 10 reads/s for network; local log throttled below.
         Position now = {};
         const DWORD tick = GetTickCount();
         const PositionStatus status = ReadJimmyPosition(base, &now);
@@ -189,6 +432,12 @@ static DWORD WINAPI PositionThread(LPVOID parameter) {
             previouslyAvailable = false;
         }
         previousStatus = status;
+        if (networkEnabled) {
+            // Guest initiates contact by sending its local coordinates.
+            // Host replies only after a valid guest packet has been received.
+            if (status == PositionStatus::Good) SendNetworkPosition(&network, now);
+            ReceiveNetworkPositions(&network, tick);
+        }
     }
     // Unreachable during normal game lifetime.
     return 0;
