@@ -1,0 +1,45 @@
+name: Build Bully Co-op Bridge Probe (x86)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+      - name: Locate source and compile x86 DLL
+        shell: pwsh
+        run: |
+          $candidate = @(Get-ChildItem -Path . -Recurse -File -Filter 'BUILD_WINDOWS.cmd' | Where-Object { $_.FullName -notmatch '\\.git\\' })
+          if ($candidate.Count -ne 1) {
+            throw "Expected exactly one BUILD_WINDOWS.cmd, found $($candidate.Count). Ensure the v0.3 source files were uploaded."
+          }
+          $folder = $candidate[0].Directory.FullName
+          if (-not (Test-Path (Join-Path $folder 'bridge/dinput8_proxy.cpp'))) {
+            throw 'Missing bridge/dinput8_proxy.cpp beside BUILD_WINDOWS.cmd'
+          }
+          Push-Location $folder
+          try {
+            & cmd.exe /d /c 'BUILD_WINDOWS.cmd'
+            if ($LASTEXITCODE -ne 0) { throw "BUILD_WINDOWS.cmd failed: $LASTEXITCODE" }
+            $dll = Join-Path $folder 'out/dinput8.dll'
+            if (-not (Test-Path $dll)) { throw 'Build completed without out/dinput8.dll' }
+            $bytes = [IO.File]::ReadAllBytes($dll)
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 77 -or $bytes[1] -ne 90) { throw 'Invalid DLL: missing MZ header' }
+            $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+            if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550) { throw 'Invalid PE header' }
+            if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x014c) { throw 'Not a 32-bit x86 DLL' }
+            New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/build-output" | Out-Null
+            Copy-Item $dll "$env:GITHUB_WORKSPACE/build-output/dinput8.dll"
+          } finally { Pop-Location }
+      - name: Upload bridge DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: BullyCoop-Hamdan-Bridge-Probe-x86
+          path: build-output/dinput8.dll
+          if-no-files-found: error
+
